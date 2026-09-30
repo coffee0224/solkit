@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+        torch: ["2.4", "2.9", "2.14"]
+        exclude:
+          - python: "3.10"
+            torch: "2.14"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync
+      - run: >
+          uv pip install "torch~=${{ matrix.torch }}.0"
+          --index-url https://download.pytorch.org/whl/cpu
+      - run: uv run pytest -q
+
+  wheel-smoke:
+    # Install the built wheel into a clean venv and run the shipped example —
+    # catches "installs but is broken" packaging bugs (missing package data,
+    # repo-root-relative paths, ...) before they reach users.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv build
+      - run: |
+          uv venv /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/python -c "import solkit; assert solkit.list_archs()"
+          /tmp/smoke/bin/solkit analyze examples/gqa_bench.py --arch H100_PCIe --per-op
