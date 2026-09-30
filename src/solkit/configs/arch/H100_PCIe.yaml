@@ -1,0 +1,17 @@
+# NVIDIA H100 PCIe (Hopper, CC 9.0, 114 SMs, 80GB HBM2e).
+# DENSE (non-sparse) peak rates — note SOLAR's own H100 file uses sparse
+# numbers (2x dense), which halves every SOL target derived from it.
+#   fp32: 114 SM * 128 lanes = 14592 MAC/clk; values below normalized to
+#   the 2 GHz clock used by SOLAR's config (datasheet boost is 1.755 GHz).
+name: "H100_PCIe"
+SRAM_capacity: 52428800        # 50 MiB L2
+SRAM_byte_per_cycle: 10000     # ~20 TB/s L2 @ 2 GHz
+DRAM_capacity: 85899345920     # 80 GiB
+DRAM_byte_per_cycle: 1019.4    # ~2 TB/s HBM2e @ 2 GHz
+freq_GHz: 2
+MAC_per_cycle_fp32_sm: 12750   # 51 TFLOPS FP32 @ 2 GHz (datasheet)
+MAC_per_cycle_tf32_tc: 94500   # 378 TFLOPS dense
+MAC_per_cycle_fp16_tc: 189000  # 756 TFLOPS dense
+MAC_per_cycle_bf16_tc: 189000
+MAC_per_cycle_int8_tc: 378000  # 1512 TOPS dense
+MAC_per_cycle_fp8_tc: 378000
