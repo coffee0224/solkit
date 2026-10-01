@@ -84,6 +84,10 @@ VIEW_OPS = frozenset(
 )
 
 # Ops that never reach the GPU as kernels or carry no memory traffic.
+# NOTE: `_local_scalar_dense` (tensor.item()) is deliberately NOT skipped:
+# on concrete inputs it is the recorded evidence that a value was read from
+# an external storage (its 8 B region feeds the fused model), at the cost of
+# one table row per .item() call.
 SKIP_OPS = frozenset(
     f"aten.{n}.default"
     for n in [
@@ -96,6 +100,7 @@ SKIP_OPS = frozenset(
         "empty.memory_format",
         "empty_strided",
         "scalar_tensor",
+        "lift_fresh",
     ]
 )
 

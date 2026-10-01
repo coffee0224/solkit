@@ -97,8 +97,12 @@ def _(tensors, kwargs, outs):
 - Eager only: ops inside `torch.compile` regions don't dispatch and are
   invisible. Write the reference with plain torch ops.
 - Custom CUDA/Triton kernels are opaque black boxes (same as SOLAR).
-- Data-dependent control flow follows the single traced branch (same as
-  SOLAR; values are uninitialized meta data).
+- Data-dependent control flow: the trace executes on meta tensors, which
+  carry shapes but no data — branching on tensor *values* (`if x[0] > 0:`,
+  `.item()` loop bounds from `cu_seqlens`) cannot be evaluated and raises.
+  Wrap those inputs in `solkit.concrete(...)` to pass them through as real
+  tensors; they still count as external DRAM traffic, but must only feed
+  value reads, never tensor ops (real and meta tensors can't share an op).
 - The roofline models two resources (tensor-core compute, DRAM bandwidth) —
   no L2 bandwidth, occupancy, or latency effects.
 
