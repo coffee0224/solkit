@@ -27,9 +27,9 @@ from torch.utils._pytree import tree_flatten
 
 from .costs import (
     COST_FUNCS,
-    SKIP_OPS,
-    VIEW_OPS,
     OpCost,
+    is_skip_op,
+    is_view_op,
     looks_like_contraction,
     norm_op,
     sdpa_macs,
@@ -123,7 +123,7 @@ class SOLCounter(TorchDispatchMode):
             mac_dtype=cost.mac_dtype,
             other_ops=cost.other_ops,
         )
-        if name not in VIEW_OPS:
+        if not is_view_op(name):
             rec.in_bytes = sum(_tbytes(t) for t in in_tensors)
             rec.out_bytes = sum(_tbytes(t) for t in out_tensors)
         for t in in_tensors:
@@ -152,10 +152,10 @@ class SOLCounter(TorchDispatchMode):
         kwargs = kwargs or {}
         out = func(*args, **kwargs)
         name = norm_op(str(func))
-        if self._suppress == 0 and name not in SKIP_OPS:
+        if self._suppress == 0 and not is_skip_op(name):
             tensors = _flat_tensors(args) + _flat_tensors(kwargs)
             outs = _flat_tensors(out)
-            if name in VIEW_OPS:
+            if is_view_op(name):
                 cost = OpCost()  # pure metadata: no compute, no traffic
             else:
                 cost_fn = COST_FUNCS.get(name)

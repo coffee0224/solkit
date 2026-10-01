@@ -46,9 +46,13 @@ CostFn = Callable[[tuple, dict, Sequence[torch.Tensor]], OpCost]
 COST_FUNCS: Dict[str, CostFn] = {}
 
 # Ops that only manipulate metadata (views/aliases). Zero compute, zero DRAM
-# traffic: a view op executed as its own kernel would move no bytes.
+# traffic: a view op executed as its own kernel would move no bytes. Matched
+# by base name, overload-insensitive: indexing dispatches as
+# aten.select.int / aten.slice.Tensor, .transpose(-1, -2) as
+# aten.transpose.int, t.size(0) as aten.size.int — never the .default forms
+# that a full-name match would catch.
 VIEW_OPS = frozenset(
-    f"aten.{n}.default"
+    "aten." + n
     for n in [
         "view",
         "reshape",
@@ -83,13 +87,19 @@ VIEW_OPS = frozenset(
     ]
 )
 
+
+def is_view_op(name: str) -> bool:
+    return name.rsplit(".", 1)[0] in VIEW_OPS
+
+
 # Ops that never reach the GPU as kernels or carry no memory traffic.
+# Matched by base name like VIEW_OPS (aten.size.int, aten.stride.int, ...).
 # NOTE: `_local_scalar_dense` (tensor.item()) is deliberately NOT skipped:
 # on concrete inputs it is the recorded evidence that a value was read from
 # an external storage (its 8 B region feeds the fused model), at the cost of
 # one table row per .item() call.
 SKIP_OPS = frozenset(
-    f"aten.{n}.default"
+    "aten." + n
     for n in [
         "size",
         "dim",
@@ -97,12 +107,16 @@ SKIP_OPS = frozenset(
         "stride",
         "is_contiguous",
         "is_floating_point",
-        "empty.memory_format",
+        "empty",
         "empty_strided",
         "scalar_tensor",
         "lift_fresh",
     ]
 )
+
+
+def is_skip_op(name: str) -> bool:
+    return name.rsplit(".", 1)[0] in SKIP_OPS
 
 
 def norm_op(name: str) -> str:

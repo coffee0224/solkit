@@ -42,6 +42,35 @@ def test_fused_dedups_views_vs_base():
     assert r.bytes.fused_read_bytes == 64 * 64 * 2
 
 
+def test_indexing_is_free_in_unfused():
+    # t[1] dispatches aten.select.int (not .default): must still be a free
+    # view, charged zero unfused bytes, while tracking its read region.
+    x = torch.randn(4, 8)
+    r = solkit.analyze(lambda t: t[1] * 2.0, x)
+    assert r.bytes.unfused_bytes == 32 + 32  # only the mul
+    rows = [row for row in r.per_op() if row["op"] == "aten.select.int"]
+    assert rows and all(row["in_bytes"] == 0 and row["out_bytes"] == 0 for row in rows)
+    # reads charge the op-input extent: the select's input is all of x
+    assert r.bytes.fused_read_bytes == 128
+
+
+def test_slice_and_transpose_are_free_in_unfused():
+    x = torch.randn(4, 8)
+    r = solkit.analyze(lambda t: t[1:3] * 2.0, x)  # aten.slice.Tensor
+    assert r.bytes.unfused_bytes == 64 + 64
+    assert r.bytes.fused_read_bytes == 128  # slice's input is all of x
+
+    r2 = solkit.analyze(lambda t: t.transpose(0, 1) * 2.0, x)  # aten.transpose.int
+    assert r2.bytes.unfused_bytes == 128 + 128
+
+
+def test_size_queries_are_skipped():
+    x = torch.randn(4, 8)
+    r = solkit.analyze(lambda t: t[: t.size(0)] * 2.0, x)
+    assert r.bytes.unfused_bytes == 128 + 128  # only the mul
+    assert all(not row["op"].startswith("aten.size.") for row in r.per_op())
+
+
 def test_outputs_written_once():
     a = torch.randn(4, 8, dtype=torch.float16)
     b = torch.randn(8, 5, dtype=torch.float16)
