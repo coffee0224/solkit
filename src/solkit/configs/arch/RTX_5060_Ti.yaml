@@ -1,7 +1,8 @@
 # NVIDIA GeForce RTX 5060 Ti (Blackwell, CC 12.0, GB206, 36 SMs, 16GB GDDR7).
-# Theoretical values; MAC rates follow the FP16-accumulate convention.
-#   fp32: 36 SM * 128 lanes; tf32 tc: 36 * 128; fp16/bf16 tc: 36 SM * 512;
-#   int8/fp8 tc: 36 SM * 1024
+# Theoretical peaks; tensor MAC rates read from ncu ops_path peak_sustained
+# counters (fp32-accumulate paths, what torch matmul emits).
+#   fp32: 36 SM * 128 lanes; tf32 tc: 36 * 256; fp16/bf16 tc: 36 SM * 512;
+#   int8 tc: 36 SM * 2048; fp8 tc: 36 SM * 1024 (per ncu ops_path peak_sustained)
 # Derived and cross-checked with ncu on the target card (pipe-active
 # back-calculation); see README "Deriving arch configs" for the method.
 # The optional `measured:` block carries ncu-calibrated bandwidth values.
@@ -12,9 +13,12 @@ DRAM_capacity: 17074421760     # 16 GiB
 DRAM_byte_per_cycle: 172       # 441 GB/s @ 2.58 GHz (spec 448 GB/s)
 freq_GHz: 2.58                 # sustained SM clock under load (max 3.09)
 MAC_per_cycle_fp32_sm: 4608    # 36 SM * 128
-MAC_per_cycle_tf32_tc: 4608    # 36 * 128 = fp16/4; sweep plateau 4430 (96%)
-MAC_per_cycle_fp16_tc: 18432   # 36 * 512; ncu: s16816 GEMM at 99% pipe = 2x
+MAC_per_cycle_tf32_tc: 9216    # ncu peak_sustained 512 ops/SM/clk; cublas
+                               # legacy-HMMA kernels reach only ~49% of it
+MAC_per_cycle_fp16_tc: 18432   # ncu peak_sustained (fp32-acc path), 1024
+                               # ops/SM/clk; fp16-acc path would be 36864
 MAC_per_cycle_bf16_tc: 18432
-MAC_per_cycle_int8_tc: 36864   # ncu: torch._int_mm 184.6 TOPS back-calc
-MAC_per_cycle_fp8_tc: 36864    # = int8 (36 * 1024); spec 759 AI TOPS / 4;
-                               # measured nvjet_sm120 kernel at 96.8% pipe = 90%
+MAC_per_cycle_int8_tc: 73728   # ncu peak_sustained 4096 ops/SM/clk; the old
+                               # 36864 was a back-calc off a half-rate kernel
+MAC_per_cycle_fp8_tc: 36864    # ncu peak_sustained; nvjet_sm120 kernel
+                               # reaches 96.8% (759 AI TOPS = dense fp4 anchor)
