@@ -1,42 +1,59 @@
 #!/usr/bin/env python3
 """Derive a solkit arch config from the GPU in this machine.
 
-Three tiers of fidelity, all automated:
+Values are obtained in priority order:
 
-1. Static properties (name, SM count, L2/DRAM capacity) come from
-   ``torch.cuda.get_device_properties`` -- exact.
-2. Sustained SM clock -- sampled via pynvml or ``nvidia-smi`` while
-   benchmarks hold the GPU busy. The boost clock is NOT the right
-   divisor; under load consumer cards settle 10-20%% lower.
-3. Throughput rates (DRAM bandwidth, MAC rate per dtype) -- CUDA-event
-   timed microbenchmarks: a large device-to-device copy, and big square
-   GEMMs per dtype (tensor-core pipes where applicable). These are
-   *achieved* numbers: lower bounds on the dense peak, in practice
-   within ~5-15%% of it.
+1. **ncu counters, where they exist** (exact hardware peaks, immune to
+   kernel quality): per-dtype tensor MAC rates from
+   ``sm__ops_path_tensor_src_<dt>_dst_fp32.sum.peak_sustained`` (ops are
+   counted as 2 per MAC, summed over SMs), DRAM and L2 peaks from
+   ``dram__bytes`` / ``lts__t_bytes`` ``.sum.peak_sustained_elapsed.per_second``.
+   One profiled GEMM yields all of them at once.
+2. **CUDA-event microbenchmarks** for the rest (achieved numbers, lower
+   bounds of the peaks): fp32 always (CUDA cores have no ops_path
+   metric), any tensor dtype ncu did not report on this arch, and a D2D
+   elementwise kernel for DRAM if the counter read failed.
 
-For exact peaks, wrap the ``--probe`` modes in ncu and back-calculate
-(the script prints the commands); put the results in the YAML's
-``measured:`` block.
+Static properties come from ``torch.cuda.get_device_properties``; the
+sustained SM clock (needed to turn bytes/s into bytes/cycle) is sampled
+under GEMM load -- the boost clock is NOT the right divisor.
 
 Usage:
     python tools/derive_arch.py                    # YAML to stdout
     python tools/derive_arch.py --out my_gpu.yaml
+    python tools/derive_arch.py --no-ncu           # benchmarks only
     python tools/derive_arch.py --freq 2.58        # skip clock sampling
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
+import shutil
 import statistics
 import subprocess
 import sys
 import threading
 import time
 from datetime import date
+from pathlib import Path
 
 import torch
 
 GEMM_DTYPES = ["fp32", "tf32", "fp16", "bf16", "int8", "fp8"]
+
+# ncu "math ops" are counted as 2 per MAC (verified: a n^3-MAC GEMM reports
+# 2*n^3 ops). .sum aggregates per-SM rates into a GPU-wide per-cycle figure.
+NCU_TENSOR_METRIC = {
+    "tf32": "sm__ops_path_tensor_src_tf32_dst_fp32.sum.peak_sustained",
+    "fp16": "sm__ops_path_tensor_src_fp16_dst_fp32.sum.peak_sustained",
+    "bf16": "sm__ops_path_tensor_src_bf16_dst_fp32.sum.peak_sustained",
+    "int8": "sm__ops_path_tensor_src_int8.sum.peak_sustained",
+    "fp8": "sm__ops_path_tensor_src_fp8_dst_fp32.sum.peak_sustained",
+}
+NCU_DRAM = "dram__bytes.sum.peak_sustained_elapsed.per_second"
+NCU_L2 = "lts__t_bytes.sum.peak_sustained_elapsed.per_second"
 
 
 def _read_sm_clock_mhz() -> int | None:
@@ -158,18 +175,19 @@ def gemm_fn(name: str, n: int):
     raise ValueError(name)
 
 
-def measure(size: int, iters: int) -> dict:
-    """Absolute achieved rates: DRAM GB/s (copy) and MACs/s per dtype (GEMM)."""
-    out: dict = {}
+def measure(size: int, iters: int, dtypes: list[str], with_dram: bool) -> dict:
+    """Absolute achieved rates for the dtypes ncu could not cover."""
+    out: dict = {"dram_bps": None}
 
-    src = torch.empty(1 << 30, dtype=torch.uint8, device="cuda")
-    dst = torch.empty_like(src)
-    # an elementwise kernel, not copy_ (which is a DMA memcpy: no kernel for
-    # ncu to see, and often a slightly different path)
-    t = bench(lambda: torch.mul(src, 2, out=dst), iters=iters)
-    out["dram_copy_gbps"] = 2 * src.numel() / t / 1e9
+    if with_dram:
+        src = torch.empty(1 << 30, dtype=torch.uint8, device="cuda")
+        dst = torch.empty_like(src)
+        # an elementwise kernel, not copy_ (which is a DMA memcpy: no kernel for
+        # ncu to see, and often a slightly different path)
+        t = bench(lambda: torch.mul(src, 2, out=dst), iters=iters)
+        out["dram_bps"] = 2 * src.numel() / t
 
-    for name in GEMM_DTYPES:
+    for name in dtypes:
         n = size if name != "fp32" else size // 2
         try:
             pair = gemm_fn(name, n)
@@ -183,6 +201,51 @@ def measure(size: int, iters: int) -> dict:
         except Exception as e:  # unsupported dtype/kernel on this card
             out[name] = None
             print(f"# {name}: skipped ({type(e).__name__}: {e})")
+    return out
+
+
+def ncu_peaks(size: int) -> dict:
+    """Hardware peaks straight from ncu counters; partial dict on failure.
+
+    peak_sustained metrics are unit properties, so one profiled GEMM
+    reports every path's peak regardless of which pipe the kernel uses.
+    """
+    ncu = shutil.which("ncu")
+    if ncu is None:
+        return {}
+    metrics = list(NCU_TENSOR_METRIC.values()) + [NCU_DRAM, NCU_L2]
+    cmd = [
+        ncu, "--csv", "--target-processes", "all", "--clock-control", "none",
+        "--metrics", ",".join(metrics),
+        sys.executable, str(Path(__file__).resolve()), "--probe", "gemm-bf16",
+        "--size", str(size),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"# ncu unavailable ({type(e).__name__}); falling back to benchmarks", file=sys.stderr)
+        return {}
+
+    want = set(metrics)
+    vals: dict[str, float] = {}
+    for row in csv.reader(io.StringIO(proc.stdout)):
+        if len(row) < 3 or row[-3] not in want:
+            continue
+        try:
+            vals[row[-3]] = float(row[-1].replace(",", ""))
+        except ValueError:
+            continue
+    if not vals and proc.returncode != 0:
+        print(f"# ncu failed (exit {proc.returncode}); falling back to benchmarks", file=sys.stderr)
+
+    out: dict = {}
+    for dt, metric in NCU_TENSOR_METRIC.items():
+        if metric in vals:
+            out[dt] = vals[metric] / 2  # ops are 2 per MAC
+    if NCU_DRAM in vals:
+        out["dram_bps"] = vals[NCU_DRAM]
+    if NCU_L2 in vals:
+        out["l2_bps"] = vals[NCU_L2]
     return out
 
 
@@ -208,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--freq", type=float, default=None, help="skip clock sampling; use this GHz")
     ap.add_argument("--size", type=int, default=8192, help="GEMM edge size (default 8192)")
     ap.add_argument("--iters", type=int, default=10, help="timed iterations per benchmark")
+    ap.add_argument("--no-ncu", action="store_true", help="never call ncu; benchmarks only")
     ap.add_argument("--probe", default=None, help="single-kernel mode for ncu: copy | gemm-<dtype>")
     args = ap.parse_args(argv)
 
@@ -223,6 +287,11 @@ def main(argv: list[str] | None = None) -> int:
     props = torch.cuda.get_device_properties(0)
     print(f"measuring on {props.name} (CC {props.major}.{props.minor}) ...", file=sys.stderr)
 
+    peaks = {} if args.no_ncu else ncu_peaks(args.size)
+    got = [dt for dt in GEMM_DTYPES if dt in peaks]
+    if got:
+        print(f"ncu: direct peaks for {', '.join(got)} + DRAM/L2", file=sys.stderr)
+
     # Clocks ramp above the sustained point for the first seconds of load,
     # so sample across the whole settle + benchmark window and take the median.
     warm_a = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
@@ -236,7 +305,9 @@ def main(argv: list[str] | None = None) -> int:
             warm_a @ warm_a
         torch.cuda.synchronize()
 
-    res = measure(args.size, args.iters)
+    need_dram = peaks.get("dram_bps") is None
+    need_gemm = [d for d in GEMM_DTYPES if d not in peaks]  # fp32 is never in peaks
+    res = measure(args.size, args.iters, need_gemm, need_dram)
 
     if mon is not None:
         sampled = mon.stop()
@@ -247,53 +318,78 @@ def main(argv: list[str] | None = None) -> int:
             print("could not sample clocks; pass --freq", file=sys.stderr)
             return 2
 
-    def mac_line(val: float | None, yaml_key: str) -> str:
+    def src(dt: str) -> str:
+        return "ncu" if dt in peaks else "bench"
+
+    def mac_line(val: float | None, yaml_key: str, src: str) -> str:
         if val is None:
             return f"# {yaml_key}: UNSUPPORTED/FAILED on this card"
-        per_cycle = round(val / (freq * 1e9))
-        return f"{yaml_key}: {per_cycle:d}    # achieved on {args.size}-cube GEMM (lower bound of dense peak)"
+        # ncu peak_sustained is already per-cycle; benchmarks report MACs/s.
+        per_cycle = round(val) if src == "ncu" else round(val / (freq * 1e9))
+        if src == "ncu":
+            return f"{yaml_key}: {per_cycle:d}    # ncu peak_sustained (hardware peak)"
+        return (
+            f"{yaml_key}: {per_cycle:d}    # GEMM achieved on this stack "
+            f"(lower bound of peak; no ncu metric)"
+        )
+
+    dram_bps = peaks.get("dram_bps") or res["dram_bps"]
+    if dram_bps:
+        dram_src = "ncu peak" if peaks.get("dram_bps") else "D2D-copy achieved (~85-92% of peak)"
+        dram_line = (
+            f"DRAM_byte_per_cycle: {round(dram_bps / (freq * 1e9)):d}    # {dram_src} "
+            f"({dram_bps / 1e9:.0f} GB/s)"
+        )
+    else:
+        dram_line = "# DRAM_byte_per_cycle: FAILED (no ncu metric, copy bench failed)"
+
+    l2_bps = peaks.get("l2_bps")
+    if l2_bps:
+        sram_line = (
+            f"SRAM_byte_per_cycle: {round(l2_bps / (freq * 1e9)):d}    # ncu peak "
+            f"({l2_bps / 1e9:.0f} GB/s), informational"
+        )
+    else:
+        sram_line = (
+            "# SRAM_byte_per_cycle: <optional> L2 bandwidth, informational only;\n"
+            "#   ncu: lts__t_bytes.sum.peak_sustained_elapsed.per_second / freq"
+        )
 
     lines = [
         f"# Derived {date.today()} by tools/derive_arch.py on {props.name} "
         f"(CC {props.major}.{props.minor}, {props.multi_processor_count} SMs).",
-        "# Rates are *achieved* (microbenchmark, <= dense peak). For exact peaks",
-        "# run the ncu back-calcs printed to stderr and move values into `measured:`.",
+        "# MAC/clk and byte/clk peaks: ncu counters where available (exact),",
+        "# CUDA-event benchmarks elsewhere (achieved, <= peak).",
         f'name: "{props.name.replace(" ", "_")}"',
         f"SRAM_capacity: {getattr(props, 'L2_cache_size', 0)}    # L2, from get_device_properties",
-        "# SRAM_byte_per_cycle: <optional> L2 bandwidth, informational only;",
-        "#   ncu: lts__t_bytes.sum.per_second / lts__throughput.avg.pct_of_peak_sustained_elapsed / freq",
+        sram_line,
         f"DRAM_capacity: {props.total_memory}",
-        f"DRAM_byte_per_cycle: {round(res['dram_copy_gbps'] / freq):d}    # D2D-copy achieved "
-        f"({res['dram_copy_gbps']:.0f} GB/s); true peak ~5-15% higher",
+        dram_line,
         f"freq_GHz: {freq:.2f}    # sampled under load",
-        mac_line(res["fp32"], "MAC_per_cycle_fp32_sm"),
-        mac_line(res["tf32"], "MAC_per_cycle_tf32_tc"),
-        mac_line(res["fp16"], "MAC_per_cycle_fp16_tc"),
-        mac_line(res["bf16"], "MAC_per_cycle_bf16_tc"),
-        mac_line(res["int8"], "MAC_per_cycle_int8_tc"),
-        mac_line(res["fp8"], "MAC_per_cycle_fp8_tc"),
+        mac_line(peaks.get("fp32") or res.get("fp32"), "MAC_per_cycle_fp32_sm", "bench"),
+        mac_line(peaks.get("tf32") or res.get("tf32"), "MAC_per_cycle_tf32_tc", src("tf32")),
+        mac_line(peaks.get("fp16") or res.get("fp16"), "MAC_per_cycle_fp16_tc", src("fp16")),
+        mac_line(peaks.get("bf16") or res.get("bf16"), "MAC_per_cycle_bf16_tc", src("bf16")),
+        mac_line(peaks.get("int8") or res.get("int8"), "MAC_per_cycle_int8_tc", src("int8")),
+        mac_line(peaks.get("fp8") or res.get("fp8"), "MAC_per_cycle_fp8_tc", src("fp8")),
     ]
     yaml_text = "\n".join(lines) + "\n"
 
     if args.out:
-        from pathlib import Path
-
         Path(args.out).write_text(yaml_text)
         print(f"wrote {args.out}", file=sys.stderr)
     else:
         print(yaml_text)
 
-    py = sys.executable
-    print(
-        "\nExact-peak ncu back-calcs (value = rate / (pct/100), then / freq in cycles):\n"
-        "  DRAM:  ncu --metrics dram__bytes.sum.per_second,dram__throughput.avg.pct_of_peak_sustained_elapsed "
-        f"{py} tools/derive_arch.py --probe copy\n"
-        "  fp16:  ncu --metrics sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed "
-        f"{py} tools/derive_arch.py --probe gemm-fp16\n"
-        "(repeat the fp16 line per dtype; copy bandwidth needs no clock lock, "
-        "but match the freq you put in the YAML)",
-        file=sys.stderr,
-    )
+    if not peaks:
+        py = sys.executable
+        print(
+            "\nncu not used; for exact peaks instead of achieved numbers, install ncu and rerun,\n"
+            "or wrap the probes manually:\n"
+            "  ncu --metrics sm__ops_path_tensor_src_fp16_dst_fp32.sum.peak_sustained "
+            f"{py} tools/derive_arch.py --probe gemm-fp16\n",
+            file=sys.stderr,
+        )
     return 0
 
 
