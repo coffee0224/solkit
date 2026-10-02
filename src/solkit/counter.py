@@ -28,6 +28,7 @@ from torch.utils._pytree import tree_flatten
 from .costs import (
     COST_FUNCS,
     OpCost,
+    einsum_cost,
     is_skip_op,
     is_view_op,
     looks_like_contraction,
@@ -180,6 +181,43 @@ class SOLCounter(TorchDispatchMode):
         in_tensors = [q, k, v] + ([mask] if mask is not None else [])
         self._record(SDPA_OP, in_tensors, [out], cost)
 
+    # -- analytical einsum ---------------------------------------------------
+
+    def record_einsum(
+        self,
+        equation: str,
+        operands: List[torch.Tensor],
+        outs: List[torch.Tensor],
+        cost: OpCost,
+    ) -> None:
+        self._record(f"einsum:{equation}", operands, outs, cost)
+
+    def _hook_einsum(self, func, args, kwargs):
+        """Charge torch.einsum analytically; fall back to decomposition loudly."""
+        if args and isinstance(args[0], torch.Tensor):
+            equation, operands = args[1], [args[0]]  # Tensor.einsum method form
+        else:
+            equation, operands = args[0], list(args[1:])
+            if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+                operands = list(operands[0])
+        if not isinstance(equation, str) or not operands:
+            return func(*args, **kwargs)
+        try:
+            cost = einsum_cost(equation, operands)
+        except ValueError as e:
+            self.warnings.append(
+                f"torch.einsum('{equation}') not charged analytically ({e}); "
+                f"its decomposition is counted instead"
+            )
+            return func(*args, **kwargs)
+        self._suppress += 1
+        try:
+            out = func(*args, **kwargs)
+        finally:
+            self._suppress -= 1
+        self.record_einsum(equation, operands, _flat_tensors(out), cost)
+        return out
+
 
 class _FnHook(TorchFunctionMode):
     """Outer mode: charge SDPA analytically, suppress its decomposition."""
@@ -200,6 +238,8 @@ class _FnHook(TorchFunctionMode):
                 self.counter._suppress -= 1
             self.counter.record_sdpa(q, k, v, mask, bool(is_causal), out)
             return out
+        if func is torch.einsum or getattr(func, "__name__", "") == "einsum":
+            return self.counter._hook_einsum(func, args, kwargs)
         return func(*args, **kwargs)
 
 

@@ -38,6 +38,12 @@ pyyaml**:
   Python API level and charged analytically (on meta tensors it would
   otherwise decompose into two full bmms and over-count causal attention
   ~2x).
+- Analytic einsum — `torch.einsum` is intercepted at the Python API level and
+  charged from its equation (`MACs = prod(output dims) * prod(summed dims)`,
+  at the promoted input dtype). By dispatch time the equation is gone, and
+  eager lowers summed dims of size 1 to a broadcast mul — dispatch-level
+  counting would silently report 0 MACs for exactly those (rank-1 update)
+  patterns a fused chunked kernel runs as real GEMMs.
 - No LLM-generated handlers — unknown ops warn loudly and are countable via a
   public registry; nothing is ever guessed silently.
 

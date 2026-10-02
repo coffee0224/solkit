@@ -18,6 +18,7 @@ The public extension point is :func:`register_cost`::
 
 from __future__ import annotations
 
+import string
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence
 
@@ -182,6 +183,96 @@ def sdpa_macs(q: torch.Tensor, k: torch.Tensor, is_causal: bool) -> int:
         visible = tq * tk
     batch = _prod(q.shape[:-2])  # q carries the fully-expanded batch dims
     return 2 * batch * visible * d
+
+
+def einsum_cost(equation: str, operands: Sequence[torch.Tensor]) -> OpCost:
+    """Analytic cost of ``torch.einsum(equation, *operands)`` from the equation.
+
+    eager lowers einsum at dispatch time (permute/reshape/bmm — or a plain
+    broadcast mul when the summed dim has size 1), so the equation itself
+    never reaches ``__torch_dispatch__``; this charges the contraction the
+    *algorithm* performs instead:
+
+    - two or more operands with at least one summed index (present in the
+      inputs, absent from the output): ``MACs = prod(output dims) *
+      prod(summed dims)`` at the promoted input dtype. Degenerate
+      contractions (summed dim of size 1 — rank-1 outer updates, the GDN
+      delta-rule pattern) are charged as contractions: the SOL denominator
+      assumes a fused kernel can batch them into real GEMMs, which a chunked
+      formulation does.
+    - two or more operands, no summed index: elementwise product.
+    - one operand with a summed index: reduction (adds, no MACs).
+    - one operand, no summed index: permutation/diagonal — free.
+
+    Raises ``ValueError`` on anything not parsed exactly (repeated labels in
+    one operand, mismatched ellipsis ranks, label size conflicts); callers
+    should then fall back to decomposition accounting with a warning.
+    """
+    eq = equation.replace(" ", "")
+    if eq.count("->") > 1:
+        raise ValueError("multiple '->'")
+    if "->" in eq:
+        in_part, out_part = eq.split("->")
+    else:
+        in_part, out_part = eq, None
+    specs = in_part.split(",")
+    if len(specs) != len(operands):
+        raise ValueError("operand count mismatch")
+
+    used = {c for c in eq if c.isalpha()}
+    ell_ranks = {t.ndim - (len(s) - 3) for s, t in zip(specs, operands) if "..." in s}
+    if len(ell_ranks) > 1:
+        raise ValueError("mismatched ellipsis ndim")
+    n_ell = ell_ranks.pop() if ell_ranks else 0
+    pool = [c for c in string.ascii_letters if c not in used]
+    if n_ell > len(pool):
+        raise ValueError("too many ellipsis dims for the unused letters")
+
+    sizes: Dict[str, int] = {}
+    op_labels: list = []
+    for spec, t in zip(specs, operands):
+        if spec.count("...") > 1:
+            raise ValueError("multiple ellipses in one operand")
+        i = spec.find("...")
+        labels = list(spec) if i < 0 else list(spec[:i]) + pool[:n_ell] + list(spec[i + 3 :])
+        if len(labels) != t.ndim:
+            raise ValueError(f"subscripts {spec!r} do not match dim {t.ndim}")
+        if len(set(labels)) != len(labels):
+            raise ValueError(f"repeated label in {spec!r} (diagonal) not supported")
+        op_labels.append(labels)
+        for lbl, d in zip(labels, t.shape):
+            n = int(d)
+            prev = sizes.get(lbl)
+            if prev is not None and prev != n and prev != 1 and n != 1:
+                raise ValueError(f"label {lbl!r} size conflict {prev} vs {n}")
+            sizes[lbl] = max(prev or n, n)
+
+    if out_part is None:
+        counts: Dict[str, int] = {}
+        for labels in op_labels:
+            for lbl in labels:
+                counts[lbl] = counts.get(lbl, 0) + 1
+        out_labels = sorted(lb for lb, c in counts.items() if c == 1)
+    elif "..." in out_part:
+        i = out_part.find("...")
+        out_labels = list(out_part[:i]) + pool[:n_ell] + list(out_part[i + 3 :])
+    else:
+        out_labels = list(out_part)
+    if any(lb not in sizes for lb in out_labels):
+        raise ValueError("output label missing from inputs")
+
+    out_numel = _prod(sizes[lb] for lb in out_labels)
+    summed = [sizes[lb] for lb in sizes if lb not in set(out_labels)]
+    if len(operands) >= 2 and summed:
+        dt = operands[0].dtype
+        for t in operands[1:]:
+            dt = torch.promote_types(dt, t.dtype)
+        return OpCost(macs=out_numel * _prod(summed), mac_dtype=dt)
+    if len(operands) >= 2:
+        return OpCost(other_ops=out_numel)  # elementwise product
+    if summed:
+        return OpCost(other_ops=out_numel * _prod(summed))  # reduction
+    return OpCost()  # permutation / diagonal: materialized copy, no ALU
 
 
 def _mm_cost(args, kwargs, outs):
